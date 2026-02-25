@@ -41,7 +41,11 @@ const EXCLUDED_KEYS = new Set([
   '$schema', 'additionalProperties', 'minLength', 'maxLength',
   'minItems', 'maxItems', 'uniqueItems', 'exclusiveMaximum',
   'exclusiveMinimum', 'const', 'anyOf', 'oneOf', 'allOf',
-  'any_of', 'one_of', 'all_of', 'multipleOf'
+  'any_of', 'one_of', 'all_of', 'multipleOf',
+  // Gemini API 不支持的高级 JSON Schema 字段
+  'propertyNames', 'patternProperties', 'dependencies',
+  'if', 'then', 'else', 'not', 'contentMediaType', 'contentEncoding',
+  'definitions', '$defs', '$ref', '$id', '$comment'
 ]);
 
 // 需要转换为大写的 type 值映射
@@ -59,9 +63,25 @@ export function cleanParameters(obj) {
   const cleaned = Array.isArray(obj) ? [] : {};
   for (const [key, value] of Object.entries(obj)) {
     if (EXCLUDED_KEYS.has(key)) continue;
-    if (key === 'type' && typeof value === 'string') {
-      // 将 type 值转换为大写以匹配官方 API 格式
-      cleaned[key] = TYPE_UPPERCASE_MAP[value.toLowerCase()] || value.toUpperCase();
+    if (key === 'type') {
+      // 处理 type 字段
+      if (typeof value === 'string') {
+        // 字符串类型：转换为大写
+        cleaned[key] = TYPE_UPPERCASE_MAP[value.toLowerCase()] || value.toUpperCase();
+      } else if (Array.isArray(value)) {
+        // 数组类型（如 ["string", "null"]）：取第一个非 null 的类型
+        // Gemini API 不支持联合类型，需要转换为单一类型
+        const nonNullType = value.find(t => t !== 'null' && t !== null);
+        if (nonNullType && typeof nonNullType === 'string') {
+          cleaned[key] = TYPE_UPPERCASE_MAP[nonNullType.toLowerCase()] || nonNullType.toUpperCase();
+        } else {
+          // 如果都是 null 或找不到有效类型，默认为 STRING
+          cleaned[key] = 'STRING';
+        }
+      } else {
+        // 其他情况，保持原值
+        cleaned[key] = value;
+      }
     } else {
       cleaned[key] = (value && typeof value === 'object') ? cleanParameters(value) : value;
     }
@@ -118,7 +138,10 @@ export function modelMapping(modelName) {
 
   // Original logic (kept for backward compatibility)
   if (modelName === 'claude-sonnet-4-5-thinking') return 'claude-sonnet-4-5';
-  if (modelName === 'claude-opus-4-5') return 'claude-opus-4-5-thinking';
+  // if (modelName === 'claude-opus-4-5') return 'claude-opus-4-5-thinking';
+  if (modelName === 'claude-opus-4-5') return 'claude-opus-4-6-thinking';
+  if (modelName === 'claude-opus-4-5-thinking') return 'claude-opus-4-6-thinking';
+  if (modelName === 'claude-opus-4-6') return 'claude-opus-4-6-thinking';
   if (modelName === 'gemini-2.5-flash-thinking') return 'gemini-2.5-flash';
   return modelName;
 }
@@ -126,7 +149,7 @@ export function modelMapping(modelName) {
 export function isEnableThinking(modelName) {
   return modelName.includes('-thinking') ||
     modelName === 'gemini-2.5-pro' ||
-    modelName === 'gemini-3-flash' ||
+    modelName.startsWith('gemini-3.1') ||
     modelName.startsWith('gemini-3-pro-') ||
     modelName === 'rev19-uic3-1p' ||
     modelName === 'gpt-oss-120b-medium';
@@ -141,6 +164,7 @@ export function generateGenerationConfig(parameters, enableThinking, actualModel
     top_k: parameters.top_k ?? config.defaults.top_k,
     max_tokens: parameters.max_tokens ?? config.defaults.max_tokens,
     thinking_budget: parameters.thinking_budget,
+    response_format: parameters.response_format,
   };
 
   // 处理 reasoning_effort 到 thinking_budget 的转换
@@ -151,10 +175,10 @@ export function generateGenerationConfig(parameters, enableThinking, actualModel
 
   // 使用统一的参数转换函数
   const generationConfig = toGenerationConfig(normalizedParams, enableThinking, actualModelName);
-  
+
   // 添加 stopSequences
   generationConfig.stopSequences = DEFAULT_STOP_SEQUENCES;
-  
+
   return generationConfig;
 }
 
@@ -173,8 +197,8 @@ export function extractSystemInstruction(openaiMessages) {
       const content = typeof message.content === 'string'
         ? message.content
         : (Array.isArray(message.content)
-            ? message.content.filter(item => item.type === 'text').map(item => item.text).join('')
-            : '');
+          ? message.content.filter(item => item.type === 'text').map(item => item.text).join('')
+          : '');
       if (content.trim()) systemTexts.push(content.trim());
     } else {
       break;
@@ -189,17 +213,17 @@ export function extractSystemInstruction(openaiMessages) {
 export function prepareImageRequest(requestBody) {
   if (!requestBody || !requestBody.request) return requestBody;
   let imageSize = "1K";
-  if (requestBody.model.includes('4K')){
+  if (requestBody.model.includes('4K')) {
     imageSize = "4K";
-  } else if (requestBody.model.includes('2K')){
+  } else if (requestBody.model.includes('2K')) {
     imageSize = "2K";
   } else {
     imageSize = "1K";
   }
-  if (imageSize !== "1K"){
+  if (imageSize !== "1K") {
     requestBody.model = requestBody.model.slice(0, -3);
   }
-  requestBody.request.generationConfig = { 
+  requestBody.request.generationConfig = {
     candidateCount: 1,
     imageConfig: {
       imageSize: imageSize

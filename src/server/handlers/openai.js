@@ -3,43 +3,27 @@
  * 处理 /v1/chat/completions 请求，支持流式和非流式响应
  */
 
-import { generateAssistantResponse, generateAssistantResponseNoStream } from '../../api/client.js';
+import { generateAssistantResponse, generateAssistantResponseNoStream, getModelsWithQuotas } from '../../api/client.js';
 import { generateRequestBody, prepareImageRequest } from '../../utils/utils.js';
 import { buildOpenAIErrorPayload } from '../../utils/errors.js';
 import logger from '../../utils/logger.js';
 import config from '../../config/config.js';
 import tokenManager from '../../auth/token_manager.js';
+import quotaManager from '../../auth/quota_manager.js';
+import {
+  createOpenAIStreamChunk as createStreamChunk,
+  createOpenAIChatCompletionResponse
+} from '../formatters/openai.js';
+import { validateIncomingChatRequest } from '../validators/chat.js';
+import { getSafeRetries } from './common/retry.js';
 import {
   createResponseMeta,
   setStreamHeaders,
   createHeartbeat,
-  getChunkObject,
-  releaseChunkObject,
   writeStreamData,
   endStream,
   with429Retry
 } from '../stream.js';
-
-/**
- * 创建流式数据块
- * 支持 DeepSeek 格式的 reasoning_content
- * @param {string} id - 响应ID
- * @param {number} created - 创建时间戳
- * @param {string} model - 模型名称
- * @param {Object} delta - 增量内容
- * @param {string|null} finish_reason - 结束原因
- * @returns {Object}
- */
-export const createStreamChunk = (id, created, model, delta, finish_reason = null) => {
-  const chunk = getChunkObject();
-  chunk.id = id;
-  chunk.object = 'chat.completion.chunk';
-  chunk.created = created;
-  chunk.model = model;
-  chunk.choices[0].delta = delta;
-  chunk.choices[0].finish_reason = finish_reason;
-  return chunk;
-};
 
 /**
  * 处理 OpenAI 格式的聊天请求
@@ -47,32 +31,55 @@ export const createStreamChunk = (id, created, model, delta, finish_reason = nul
  * @param {Response} res - Express响应对象
  */
 export const handleOpenAIRequest = async (req, res) => {
-  const { messages, model, stream = false, tools, ...params } = req.body;
-  
+  const body = req.body || {};
+  const { messages, model, stream = false, tools, ...params } = body;
+
   try {
-    if (!messages) {
-      return res.status(400).json({ error: 'messages is required' });
+    const validation = validateIncomingChatRequest('openai', body);
+    if (!validation.ok) {
+      return res.status(validation.status).json({ error: validation.message });
     }
-    
-    const token = await tokenManager.getToken();
+    if (typeof model !== 'string' || !model) {
+      return res.status(400).json({ error: 'model is required' });
+    }
+
+    const token = await tokenManager.getToken(model);
     if (!token) {
       throw new Error('没有可用的token，请运行 npm run login 获取token');
     }
-    
+
+    // 获取 tokenId 用于冷却状态管理
+    const tokenId = tokenManager.getTokenId(token);
+
+    // 创建刷新额度的回调函数
+    const refreshQuota = async () => {
+      if (!tokenId) return;
+      const quotas = await getModelsWithQuotas(token);
+      quotaManager.updateQuota(tokenId, quotas);
+    };
+
+    // 创建 with429Retry 选项
+    const createRetryOptions = (prefix) => ({
+      loggerPrefix: prefix,
+      onAttempt: () => tokenManager.recordRequest(token, model),
+      tokenId,
+      modelId: model,
+      refreshQuota
+    });
+
     const isImageModel = model.includes('-image');
     const requestBody = generateRequestBody(messages, model, params, tools, token);
-    
+
     if (isImageModel) {
       prepareImageRequest(requestBody);
     }
     //console.log(JSON.stringify(requestBody,null,2));
     const { id, created } = createResponseMeta();
-    const maxRetries = Number(config.retryTimes || 0);
-    const safeRetries = maxRetries > 0 ? Math.floor(maxRetries) : 0;
-    
+    const safeRetries = getSafeRetries(config.retryTimes);
+
     if (stream) {
       setStreamHeaders(res);
-      
+
       // 启动心跳，防止 Cloudflare 超时断连
       const heartbeatTimer = createHeartbeat(res);
 
@@ -81,7 +88,7 @@ export const handleOpenAIRequest = async (req, res) => {
           const { content, usage, reasoningSignature } = await with429Retry(
             () => generateAssistantResponseNoStream(requestBody, token),
             safeRetries,
-            'chat.stream.image '
+            createRetryOptions('chat.stream.image ')
           );
           const delta = { content };
           if (reasoningSignature && config.passSignatureToClient) {
@@ -122,7 +129,7 @@ export const handleOpenAIRequest = async (req, res) => {
               }
             }),
             safeRetries,
-            'chat.stream '
+            createRetryOptions('chat.stream ')
           );
 
           writeStreamData(res, { ...createStreamChunk(id, created, model, {}, hasToolCall ? 'tool_calls' : 'stop'), usage: usageData });
@@ -144,13 +151,13 @@ export const handleOpenAIRequest = async (req, res) => {
       // 假非流模式：使用流式API获取数据，组装成非流式响应
       req.setTimeout(0);
       res.setTimeout(0);
-      
+
       let content = '';
       let reasoningContent = '';
       let reasoningSignature = null;
       const toolCalls = [];
       let usageData = null;
-      
+
       try {
         await with429Retry(
           () => generateAssistantResponse(requestBody, token, (data) => {
@@ -168,15 +175,15 @@ export const handleOpenAIRequest = async (req, res) => {
             }
           }),
           safeRetries,
-          'chat.fake_no_stream '
+          createRetryOptions('chat.fake_no_stream ')
         );
-        
+
         // 构建非流式响应
         const message = { role: 'assistant' };
         if (reasoningContent) message.reasoning_content = reasoningContent;
         if (reasoningSignature && config.passSignatureToClient) message.thoughtSignature = reasoningSignature;
         message.content = content;
-        
+
         if (toolCalls.length > 0) {
           if (config.passSignatureToClient) {
             message.tool_calls = toolCalls;
@@ -184,21 +191,19 @@ export const handleOpenAIRequest = async (req, res) => {
             message.tool_calls = toolCalls.map(({ thoughtSignature, ...rest }) => rest);
           }
         }
-        
-        const response = {
+
+        res.json(createOpenAIChatCompletionResponse({
           id,
-          object: 'chat.completion',
           created,
           model,
-          choices: [{
-            index: 0,
-            message,
-            finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop'
-          }],
-          usage: usageData
-        };
-        
-        res.json(response);
+          content,
+          reasoningContent,
+          reasoningSignature,
+          toolCalls,
+          usage: usageData,
+          passSignatureToClient: config.passSignatureToClient,
+          stripToolCallSignature: !config.passSignatureToClient
+        }));
       } catch (error) {
         logger.error('假非流生成响应失败:', error.message);
         if (res.headersSent) return;
@@ -209,19 +214,19 @@ export const handleOpenAIRequest = async (req, res) => {
       // 非流式请求：设置较长超时，避免大模型响应超时
       req.setTimeout(0); // 禁用请求超时
       res.setTimeout(0); // 禁用响应超时
-      
+
       const { content, reasoningContent, reasoningSignature, toolCalls, usage } = await with429Retry(
         () => generateAssistantResponseNoStream(requestBody, token),
         safeRetries,
-        'chat.no_stream '
+        createRetryOptions('chat.no_stream ')
       );
-      
+
       // DeepSeek 格式：reasoning_content 在 content 之前
       const message = { role: 'assistant' };
       if (reasoningContent) message.reasoning_content = reasoningContent;
       if (reasoningSignature && config.passSignatureToClient) message.thoughtSignature = reasoningSignature;
       message.content = content;
-      
+
       if (toolCalls.length > 0) {
         // 根据配置决定是否透传工具调用中的签名
         if (config.passSignatureToClient) {
@@ -230,22 +235,20 @@ export const handleOpenAIRequest = async (req, res) => {
           message.tool_calls = toolCalls.map(({ thoughtSignature, ...rest }) => rest);
         }
       }
-      
+
       // 使用预构建的响应对象，减少内存分配
-      const response = {
+      res.json(createOpenAIChatCompletionResponse({
         id,
-        object: 'chat.completion',
         created,
         model,
-        choices: [{
-          index: 0,
-          message,
-          finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop'
-        }],
-        usage
-      };
-      
-      res.json(response);
+        content,
+        reasoningContent,
+        reasoningSignature,
+        toolCalls,
+        usage,
+        passSignatureToClient: config.passSignatureToClient,
+        stripToolCallSignature: !config.passSignatureToClient
+      }));
     }
   } catch (error) {
     logger.error('生成响应失败:', error.message);

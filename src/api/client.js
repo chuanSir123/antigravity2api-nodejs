@@ -1,25 +1,83 @@
 import tokenManager from '../auth/token_manager.js';
 import config from '../config/config.js';
-import AntigravityRequester from '../AntigravityRequester.js';
+import fingerprintRequester from '../requester.js';
 import { saveBase64Image } from '../utils/imageStorage.js';
 import logger from '../utils/logger.js';
 import memoryManager from '../utils/memoryManager.js';
 import { httpRequest, httpStreamRequest } from '../utils/httpClient.js';
-import { MODEL_LIST_CACHE_TTL } from '../constants/index.js';
+import { generateTrajectorybody } from '../utils/trajectory.js';
+import { buildRecordCodeAssistMetricsBody } from '../utils/recordCodeAssistMetrics.js';
+import { createTelemetryBatch, serializeTelemetryBatch } from "../utils/createTelemetry.js"
+import { buildClientRegister, buildFrontEnd, buildClientFeatrueHeaders, buildClientRegisterHeaders, buildFrontEndHeaders } from "../utils/unleash.js"
+import { MODEL_LIST_CACHE_TTL, QA_PAIRS } from '../constants/index.js';
 import { createApiError } from '../utils/errors.js';
-import fs from 'fs/promises';
-import fsSync from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import {
-  getLineBuffer,
-  releaseLineBuffer,
-  parseAndEmitStreamChunk,
   convertToToolCall,
   registerStreamMemoryCleanup
 } from './stream_parser.js';
 import { setSignature, shouldCacheSignature, isImageModel } from '../utils/thoughtSignatureCache.js';
+import {
+  isDebugDumpEnabled,
+  createDumpId,
+  createStreamCollector,
+  collectStreamChunk,
+  dumpFinalRequest,
+  dumpStreamResponse,
+  dumpFinalRawResponse
+} from './debugDump.js';
+import { getUpstreamStatus, readUpstreamErrorBody, isCallerDoesNotHavePermission } from './upstreamError.js';
+import { createStreamLineProcessor } from './streamLineProcessor.js';
+import { runAxiosSseStream, runNativeSseStream, postJsonAndParse } from './geminiTransport.js';
+import { parseGeminiCandidateParts, toOpenAIUsage } from './geminiResponseParser.js';
+import { randomBytes, randomUUID } from 'crypto';
 
-// 请求客户端：优先使用 AntigravityRequester，失败则自动降级到 axios
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// ==================== Token 计时器管理 ====================
+const tokenTimers = new Map(); // { tokenKey: { lastUsed: timestamp, intervalId: intervalId } }
+const TOKEN_TIMEOUT = 3 * 60 * 1000; // 3分钟
+const BACKEND_CALL_INTERVAL = 60 * 1000; // 60秒
+
+function getTokenKey(token) {
+  return token.access_token;
+}
+
+function startTokenTimer(token) {
+  const key = getTokenKey(token);
+  const now = Date.now();
+  sendClientRegister(token).catch(err => logger.warn('定时调用ClientRegister失败:', err.message));
+  sendClientFeature(token).catch(err => logger.warn('定时调用ClientFeature失败:', err.message));
+  sendFrontEnd(token).catch(err => logger.warn('定时调用FrontEnd失败:', err.message));
+
+  if (tokenTimers.has(key)) {
+    tokenTimers.get(key).lastUsed = now;
+    return;
+  }
+
+  const intervalId = setInterval(() => {
+    sendClientRegister(token).catch(err => logger.warn('定时调用ClientRegister失败:', err.message));
+    sendClientFeature(token).catch(err => logger.warn('定时调用ClientFeature失败:', err.message));
+    sendFrontEnd(token).catch(err => logger.warn('定时调用FrontEnd失败:', err.message));
+  }, BACKEND_CALL_INTERVAL);
+
+  tokenTimers.set(key, { lastUsed: now, intervalId });
+}
+
+function checkTokenTimeout() {
+  const now = Date.now();
+  for (const [key, data] of tokenTimers.entries()) {
+    if (now - data.lastUsed > TOKEN_TIMEOUT) {
+      clearInterval(data.intervalId);
+      tokenTimers.delete(key);
+    }
+  }
+}
+
+setInterval(checkTokenTimeout, 30 * 1000); // 每30秒检查一次超时
+
+// 请求客户端：优先使用 FingerprintRequester，失败则自动降级到 axios
 let requester = null;
 let useAxios = false;
 
@@ -29,122 +87,27 @@ if (config.useNativeAxios === true) {
   logger.info('使用原生 axios 请求');
 } else {
   try {
-    requester = new AntigravityRequester();
+    // 使用 src/bin/config.json 作为 TLS 指纹配置文件
+    // 检测是否在 pkg 环境中
+    const isPkg = typeof process.pkg !== 'undefined';
+
+    // 根据环境选择配置文件路径
+    const configPath = isPkg
+      ? path.join(path.dirname(process.execPath), 'bin', 'tls_config.json')  // pkg 打包环境
+      : path.join(__dirname, '..', 'bin', 'tls_config.json');  // 开发环境
+    requester = fingerprintRequester.create({
+      configPath,
+      timeout: config.timeout ? Math.ceil(config.timeout / 1000) : 30,
+      proxy: config.proxy || null,
+    });
+    logger.info('使用 FingerprintRequester 请求');
   } catch (error) {
-    logger.warn('AntigravityRequester 初始化失败，自动降级使用 axios:', error.message);
+    logger.warn('FingerprintRequester 初始化失败，自动降级使用 axios:', error.message);
     useAxios = true;
   }
 }
 
 // ==================== 调试：最终请求/原始响应完整输出（单文件追加模式） ====================
-const DEBUG_DUMP_FILE = path.join(process.cwd(), 'data', 'debug-dump.log');
-
-function isDebugDumpEnabled() {
-  return config.debugDumpRequestResponse === true;
-}
-
-// 确保目录存在
-let dumpDirEnsured = false;
-async function ensureDumpDir() {
-  if (dumpDirEnsured) return;
-  await fs.mkdir(path.dirname(DEBUG_DUMP_FILE), { recursive: true });
-  dumpDirEnsured = true;
-}
-
-// 生成时间戳
-function getTimestamp() {
-  const now = new Date();
-  const pad2 = (n) => String(n).padStart(2, '0');
-  const pad3 = (n) => String(n).padStart(3, '0');
-  return `${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())} ` +
-    `${pad2(now.getHours())}:${pad2(now.getMinutes())}:${pad2(now.getSeconds())}.${pad3(now.getMilliseconds())}`;
-}
-
-// 生成唯一请求 ID
-function createDumpId(prefix = 'dump') {
-  const rand = Math.random().toString(16).slice(2, 10);
-  return `${prefix}-${rand}`;
-}
-
-// 追加写入日志文件
-async function appendDumpLog(content) {
-  await ensureDumpDir();
-  await fs.appendFile(DEBUG_DUMP_FILE, content, 'utf8');
-}
-
-// 创建流式响应收集器
-function createStreamCollector() {
-  return { chunks: [] };
-}
-
-// 收集流式响应块
-function collectStreamChunk(collector, chunk) {
-  if (collector) collector.chunks.push(chunk);
-}
-
-// 写入请求体
-async function dumpFinalRequest(dumpId, requestBody) {
-  if (!isDebugDumpEnabled()) return;
-  try {
-    const json = JSON.stringify(requestBody, null, 2);
-    const header = `\n${'='.repeat(80)}\n[${getTimestamp()}] REQUEST ${dumpId}\n${'='.repeat(80)}\n`;
-    await appendDumpLog(header + json + '\n');
-    logger.warn(`[DEBUG_DUMP ${dumpId}] 已写入请求体到: ${DEBUG_DUMP_FILE}`);
-  } catch (e) {
-    logger.error(`[DEBUG_DUMP ${dumpId}] 写入请求体失败:`, e?.message || e);
-  }
-}
-
-// 写入流式响应（将所有 chunk 解析为 JSON 数组）
-async function dumpStreamResponse(dumpId, collector) {
-  if (!isDebugDumpEnabled() || !collector) return;
-  try {
-    const header = `\n${'-'.repeat(80)}\n[${getTimestamp()}] RESPONSE ${dumpId} (STREAM)\n${'-'.repeat(80)}\n`;
-    
-    // 解析 SSE 格式的流式响应，提取 JSON 数据
-    const rawContent = collector.chunks.join('');
-    const jsonObjects = [];
-    const lines = rawContent.split('\n');
-    
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (trimmed.startsWith('data:')) {
-        const dataStr = trimmed.slice(5).trim();
-        if (dataStr && dataStr !== '[DONE]') {
-          try {
-            const parsed = JSON.parse(dataStr);
-            jsonObjects.push(parsed);
-          } catch {
-            // 非 JSON 数据，保留原始内容
-            jsonObjects.push({ raw: dataStr });
-          }
-        }
-      }
-    }
-    
-    // 以 JSON 数组格式写入
-    const jsonOutput = JSON.stringify(jsonObjects, null, 2);
-    const footer = `\n[${getTimestamp()}] END ${dumpId}\n`;
-    
-    await appendDumpLog(header + jsonOutput + footer);
-    logger.warn(`[DEBUG_DUMP ${dumpId}] 响应记录完成 (${jsonObjects.length} 条数据)`);
-  } catch (e) {
-    logger.error(`[DEBUG_DUMP ${dumpId}] 写入流式响应失败:`, e?.message || e);
-  }
-}
-
-// 写入非流式响应（一次性写入完整响应）
-async function dumpFinalRawResponse(dumpId, rawText, ext = 'txt') {
-  if (!isDebugDumpEnabled()) return;
-  try {
-    const header = `\n${'-'.repeat(80)}\n[${getTimestamp()}] RESPONSE ${dumpId} (NO-STREAM)\n${'-'.repeat(80)}\n`;
-    const footer = `\n[${getTimestamp()}] END ${dumpId}\n`;
-    await appendDumpLog(header + (rawText ?? '') + footer);
-    logger.warn(`[DEBUG_DUMP ${dumpId}] 响应记录完成`);
-  } catch (e) {
-    logger.error(`[DEBUG_DUMP ${dumpId}] 写入响应失败:`, e?.message || e);
-  }
-}
 
 // ==================== 模型列表缓存（智能管理） ====================
 const getModelCacheTTL = () => {
@@ -157,8 +120,9 @@ let modelListCacheTime = 0;
 // 默认模型列表（当 API 请求失败时使用）
 // 使用 Object.freeze 防止意外修改，并帮助 V8 优化
 const DEFAULT_MODELS = Object.freeze([
+  'claude-opus-4-6',
   'claude-opus-4-5',
-  'claude-opus-4-5-thinking',
+  'claude-opus-4-6-thinking',
   'claude-sonnet-4-5-thinking',
   'claude-sonnet-4-5',
   'gemini-3-pro-high',
@@ -222,47 +186,42 @@ function buildHeaders(token) {
   };
 }
 
-function buildRequesterConfig(headers, body = null) {
+function buildRequesterConfig(headers, body = null, method = "POST") {
   const reqConfig = {
-    method: 'POST',
+    method: method,
     headers,
     timeout_ms: config.timeout,
     proxy: config.proxy
   };
-  if (body !== null) reqConfig.body = JSON.stringify(body);
+  if (body !== null) {
+    // 判断是否为二进制数据
+    if (Buffer.isBuffer(body) || body instanceof Uint8Array) {
+      reqConfig.body = body;  // 直接传递
+    } else {
+      reqConfig.body = JSON.stringify(body);  // JSON 对象才序列化
+    }
+  }
   return reqConfig;
 }
 
 
 // 统一错误处理
 async function handleApiError(error, token, dumpId = null) {
-  const status = error.response?.status || error.status || error.statusCode || 500;
-  let errorBody = error.message;
-  
-  if (error.response?.data?.readable) {
-    const chunks = [];
-    for await (const chunk of error.response.data) {
-      chunks.push(chunk);
-    }
-    errorBody = Buffer.concat(chunks).toString();
-  } else if (typeof error.response?.data === 'object') {
-    errorBody = JSON.stringify(error.response.data, null, 2);
-  } else if (error.response?.data) {
-    errorBody = error.response.data;
-  }
+  const status = getUpstreamStatus(error);
+  const errorBody = await readUpstreamErrorBody(error);
 
   if (dumpId) {
-    await dumpFinalRawResponse(dumpId, String(errorBody ?? ''), 'error.txt');
+    await dumpFinalRawResponse(dumpId, String(errorBody ?? ''));
   }
-  
+
   if (status === 403) {
-    if (JSON.stringify(errorBody).includes("The caller does not")){
+    if (isCallerDoesNotHavePermission(errorBody)) {
       throw createApiError(`超出模型最大上下文。错误详情: ${errorBody}`, status, errorBody);
     }
     tokenManager.disableCurrentToken(token);
     throw createApiError(`该账号没有使用权限，已自动禁用。错误详情: ${errorBody}`, status, errorBody);
   }
-  
+
   throw createApiError(`API请求失败 (${status}): ${errorBody}`, status, errorBody);
 }
 
@@ -270,10 +229,12 @@ async function handleApiError(error, token, dumpId = null) {
 // ==================== 导出函数 ====================
 
 export async function generateAssistantResponse(requestBody, token, callback) {
-  
+  startTokenTimer(token);
+  const trajectoryId = requestBody.requestId.split('/')[2];
   const headers = buildHeaders(token);
   const dumpId = isDebugDumpEnabled() ? createDumpId('stream') : null;
   const streamCollector = dumpId ? createStreamCollector() : null;
+  let num = Math.floor(Math.random() * QA_PAIRS.length);
   if (dumpId) {
     await dumpFinalRequest(dumpId, requestBody);
   }
@@ -285,64 +246,27 @@ export async function generateAssistantResponse(requestBody, token, callback) {
     sessionId: requestBody.request?.sessionId,
     model: requestBody.model
   };
-  const lineBuffer = getLineBuffer(); // 从对象池获取
-  
-  const processChunk = (chunk) => {
-    // 收集流式响应用于后续 JSON 格式化输出
-    collectStreamChunk(streamCollector, chunk);
-    const lines = lineBuffer.append(chunk);
-    for (let i = 0; i < lines.length; i++) {
-      parseAndEmitStreamChunk(lines[i], state, callback);
-    }
-  };
-  
+  const processor = createStreamLineProcessor({
+    state,
+    onEvent: callback,
+    onRawChunk: (chunk) => collectStreamChunk(streamCollector, chunk)
+  });
+
   try {
     if (useAxios) {
-      const response = await httpStreamRequest({
-        method: 'POST',
+      await runAxiosSseStream({
         url: config.api.url,
         headers,
-        data: requestBody
-      });
-      
-      // 使用 Buffer 直接处理，避免 toString 的内存分配
-      response.data.on('data', chunk => {
-        processChunk(typeof chunk === 'string' ? chunk : chunk.toString('utf8'));
-      });
-      
-      await new Promise((resolve, reject) => {
-        response.data.on('end', () => {
-          releaseLineBuffer(lineBuffer); // 归还到对象池
-          resolve();
-        });
-        response.data.on('error', reject);
+        data: requestBody,
+        timeout: config.timeout,
+        processor
       });
     } else {
       const streamResponse = requester.antigravity_fetchStream(config.api.url, buildRequesterConfig(headers, requestBody));
-      let errorBody = '';
-      let statusCode = null;
-
-      await new Promise((resolve, reject) => {
-        streamResponse
-          .onStart(({ status }) => { statusCode = status; })
-          .onData((chunk) => {
-            if (statusCode !== 200) {
-              errorBody += chunk;
-              // 错误响应也收集
-              collectStreamChunk(streamCollector, chunk);
-            } else {
-              processChunk(chunk);
-            }
-          })
-          .onEnd(() => {
-            releaseLineBuffer(lineBuffer); // 归还到对象池
-            if (statusCode !== 200) {
-              reject({ status: statusCode, message: errorBody });
-            } else {
-              resolve();
-            }
-          })
-          .onError(reject);
+      await runNativeSseStream({
+        streamResponse,
+        processor,
+        onErrorChunk: (chunk) => collectStreamChunk(streamCollector, chunk)
       });
     }
 
@@ -350,8 +274,11 @@ export async function generateAssistantResponse(requestBody, token, callback) {
     if (dumpId) {
       await dumpStreamResponse(dumpId, streamCollector);
     }
+    sendRecordCodeAssistMetrics(token, trajectoryId).catch(err => logger.warn('发送RecordCodeAssistMetrics失败:', err.message));
+    sendRecordTrajectoryAnalytics(token, num, trajectoryId).catch(err => logger.warn('发送轨迹分析失败:', err.message));
+    //sendLog(token,num,trajectoryId).catch(err => logger.warn('发送log失败:', err.message))
   } catch (error) {
-    releaseLineBuffer(lineBuffer); // 确保归还
+    try { processor.close(); } catch { }
     await handleApiError(error, token, dumpId);
   }
 }
@@ -386,14 +313,14 @@ export async function getAvailableModels() {
   if (modelListCache && (now - modelListCacheTime) < ttl) {
     return modelListCache;
   }
-  
+
   const token = await tokenManager.getToken();
   if (!token) {
     // 没有 token 时返回默认模型列表
     logger.warn('没有可用的 token，返回默认模型列表');
     return getDefaultModelList();
   }
-  
+
   const headers = buildHeaders(token);
   const data = await fetchRawModels(headers, token);
   if (!data) {
@@ -408,7 +335,7 @@ export async function getAvailableModels() {
     created,
     owned_by: 'google'
   }));
-  
+
   // 添加默认模型（如果 API 返回的列表中没有）
   const existingIds = new Set(modelList.map(m => m.id));
   for (const defaultModel of DEFAULT_MODELS) {
@@ -421,18 +348,18 @@ export async function getAvailableModels() {
       });
     }
   }
-  
+
   const result = {
     object: 'list',
     data: modelList
   };
-  
+
   // 更新缓存
   modelListCache = result;
   modelListCacheTime = now;
   const currentTTL = getModelCacheTTL();
   logger.info(`模型列表已缓存 (有效期: ${currentTTL / 1000}秒, 模型数量: ${modelList.length})`);
-  
+
   return result;
 }
 
@@ -457,143 +384,98 @@ export async function getModelsWithQuotas(token) {
       };
     }
   });
-  
+
   return quotas;
 }
 
 export async function generateAssistantResponseNoStream(requestBody, token) {
-  
+  startTokenTimer(token);
+  const trajectoryId = requestBody.requestId.split('/')[2];
   const headers = buildHeaders(token);
   const dumpId = isDebugDumpEnabled() ? createDumpId('no_stream') : null;
+  let num = Math.floor(Math.random() * QA_PAIRS.length);
+
   if (dumpId) await dumpFinalRequest(dumpId, requestBody);
   let data;
-  
   try {
-    if (useAxios) {
-      if (dumpId) {
-        const resp = await httpRequest({
-          method: 'POST',
-          url: config.api.noStreamUrl,
-          headers,
-          data: requestBody,
-          responseType: 'text'
-        });
-        const rawText = typeof resp.data === 'string' ? resp.data : JSON.stringify(resp.data, null, 2);
-        await dumpFinalRawResponse(dumpId, rawText, 'json');
-        data = JSON.parse(rawText);
-      } else {
-        data = (await httpRequest({
-          method: 'POST',
-          url: config.api.noStreamUrl,
-          headers,
-          data: requestBody
-        })).data;
-      }
-    } else {
-      const response = await requester.antigravity_fetch(config.api.noStreamUrl, buildRequesterConfig(headers, requestBody));
-      if (response.status !== 200) {
-        const errorBody = await response.text();
-        if (dumpId) await dumpFinalRawResponse(dumpId, errorBody, 'txt');
-        throw { status: response.status, message: errorBody };
-      }
-      const rawText = await response.text();
-      if (dumpId) await dumpFinalRawResponse(dumpId, rawText, 'json');
-      data = JSON.parse(rawText);
-    }
+    data = await postJsonAndParse({
+      useAxios,
+      requester,
+      url: config.api.noStreamUrl,
+      headers,
+      body: requestBody,
+      timeout: config.timeout,
+      requesterConfig: buildRequesterConfig(headers, requestBody),
+      dumpId,
+      dumpFinalRawResponse,
+      rawFormat: 'json'
+    });
+    sendRecordCodeAssistMetrics(token, trajectoryId).catch(err => logger.warn('发送RecordCodeAssistMetrics失败:', err.message));
+    sendRecordTrajectoryAnalytics(token, num, trajectoryId).catch(err => logger.warn('发送轨迹分析失败:', err.message));
+
+    //sendLog(token,num).catch(err => logger.warn('发送log失败:', err.message))
   } catch (error) {
     await handleApiError(error, token, dumpId);
   }
   //console.log(JSON.stringify(data));
-  // 解析响应内容
   const parts = data.response?.candidates?.[0]?.content?.parts || [];
-  let content = '';
-  let reasoningContent = '';
-  let reasoningSignature = null;
-  let lastSeenSignature = null;
-  const toolCalls = [];
-  const imageUrls = [];
-  
-  for (const part of parts) {
-    if (part.thoughtSignature) {
-      lastSeenSignature = part.thoughtSignature;
-    }
-    if (part.thought === true) {
-      // 思维链内容 - 使用 DeepSeek 格式的 reasoning_content
-      reasoningContent += part.text || '';
-      if (part.thoughtSignature) {
-        // 以“最新出现”的签名为准（有些响应会在末尾才给签名）
-        reasoningSignature = part.thoughtSignature;
-      }
-    } else if (part.text !== undefined) {
-      content += part.text;
-    } else if (part.functionCall) {
-      const toolCall = convertToToolCall(part.functionCall, requestBody.request?.sessionId, requestBody.model);
-      const sig = part.thoughtSignature || lastSeenSignature || null;
-      if (sig) toolCall.thoughtSignature = sig;
-      toolCalls.push(toolCall);
-    } else if (part.inlineData) {
-      // 保存图片到本地并获取 URL
-      const imageUrl = saveBase64Image(part.inlineData.data, part.inlineData.mimeType);
-      imageUrls.push(imageUrl);
-    }
-  }
+  const parsed = parseGeminiCandidateParts({
+    parts,
+    sessionId: requestBody.request?.sessionId,
+    model: requestBody.model,
+    convertToToolCall,
+    saveBase64Image
+  });
 
-  // 若本轮未在 thought part 上拿到签名，则回退使用“最后出现”的签名（Gemini 等可能只在 functionCall part 上给签名）
-  if (!reasoningSignature && lastSeenSignature) {
-    reasoningSignature = lastSeenSignature;
-  }
-  
-  // 提取 token 使用统计
-  const usage = data.response?.usageMetadata;
-  const usageData = usage ? {
-    prompt_tokens: usage.promptTokenCount || 0,
-    completion_tokens: usage.candidatesTokenCount || 0,
-    total_tokens: usage.totalTokenCount || 0
-  } : null;
-  
+  const usageData = toOpenAIUsage(data.response?.usageMetadata);
+
   // 将新的签名和思考内容写入全局缓存（按 model），供后续请求兜底使用
   const sessionId = requestBody.request?.sessionId;
   const model = requestBody.model;
-  const hasTools = toolCalls.length > 0;
+  const hasTools = parsed.toolCalls.length > 0;
   const isImage = isImageModel(model);
-  
+
   // 判断是否应该缓存签名
   if (sessionId && model && shouldCacheSignature({ hasTools, isImageModel: isImage })) {
     // 获取最终使用的签名（优先使用工具签名，回退到思维签名）
-    let finalSignature = reasoningSignature;
-    
+    let finalSignature = parsed.reasoningSignature;
+
     // 工具签名：取最后一个带 thoughtSignature 的工具作为缓存源（更接近"最新"）
     if (hasTools) {
-      for (let i = toolCalls.length - 1; i >= 0; i--) {
-        const sig = toolCalls[i]?.thoughtSignature;
+      for (let i = parsed.toolCalls.length - 1; i >= 0; i--) {
+        const sig = parsed.toolCalls[i]?.thoughtSignature;
         if (sig) {
           finalSignature = sig;
           break;
         }
       }
     }
-    
+
     if (finalSignature) {
-      const cachedContent = reasoningContent || ' ';
+      const cachedContent = parsed.reasoningContent || ' ';
       setSignature(sessionId, model, finalSignature, cachedContent, { hasTools, isImageModel: isImage });
     }
   }
 
   // 生图模型：转换为 markdown 格式
-  if (imageUrls.length > 0) {
-    let markdown = content ? content + '\n\n' : '';
-    markdown += imageUrls.map(url => `![image](${url})`).join('\n\n');
-    return { content: markdown, reasoningContent: reasoningContent || null, reasoningSignature, toolCalls, usage: usageData };
+  if (parsed.imageUrls.length > 0) {
+    let markdown = parsed.content ? parsed.content + '\n\n' : '';
+    markdown += parsed.imageUrls.map(url => `![image](${url})`).join('\n\n');
+    return { content: markdown, reasoningContent: parsed.reasoningContent, reasoningSignature: parsed.reasoningSignature, toolCalls: parsed.toolCalls, usage: usageData };
   }
-  
-  return { content, reasoningContent: reasoningContent || null, reasoningSignature, toolCalls, usage: usageData };
+
+  return { content: parsed.content, reasoningContent: parsed.reasoningContent, reasoningSignature: parsed.reasoningSignature, toolCalls: parsed.toolCalls, usage: usageData };
 }
 
 export async function generateImageForSD(requestBody, token) {
+  startTokenTimer(token);
+  const trajectoryId = requestBody.requestId.split('/')[2];
   const headers = buildHeaders(token);
   let data;
+  let num = Math.floor(Math.random() * QA_PAIRS.length);
+
   //console.log(JSON.stringify(requestBody,null,2));
-  
+
   try {
     if (useAxios) {
       data = (await httpRequest({
@@ -602,6 +484,9 @@ export async function generateImageForSD(requestBody, token) {
         headers,
         data: requestBody
       })).data;
+      sendRecordCodeAssistMetrics(token, trajectoryId).catch(err => logger.warn('发送RecordCodeAssistMetrics失败:', err.message));
+      sendRecordTrajectoryAnalytics(token, num, trajectoryId).catch(err => logger.warn('发送轨迹分析失败:', err.message));
+      //sendLog(token,num).catch(err => logger.warn('发送log失败:', err.message));
     } else {
       const response = await requester.antigravity_fetch(config.api.noStreamUrl, buildRequesterConfig(headers, requestBody));
       if (response.status !== 200) {
@@ -609,15 +494,160 @@ export async function generateImageForSD(requestBody, token) {
         throw { status: response.status, message: errorBody };
       }
       data = await response.json();
+      sendRecordCodeAssistMetrics(token, trajectoryId).catch(err => logger.warn('发送RecordCodeAssistMetrics失败:', err.message));
+      sendRecordTrajectoryAnalytics(token, num, trajectoryId).catch(err => logger.warn('发送轨迹分析失败:', err.message));
+      //sendLog(token,num).catch(err => logger.warn('发送log失败:', err.message));
     }
   } catch (error) {
     await handleApiError(error, token);
   }
-  
+
   const parts = data.response?.candidates?.[0]?.content?.parts || [];
   const images = parts.filter(p => p.inlineData).map(p => p.inlineData.data);
-  
+
   return images;
+}
+
+export async function sendRecordTrajectoryAnalytics(token, num, trajectoryId) {
+  const trajectorybody = generateTrajectorybody(num, trajectoryId);
+  const headers = buildHeaders(token);
+  try {
+    if (useAxios) {
+      await httpRequest({
+        method: 'POST',
+        url: config.api.recordTrajectory,
+        headers,
+        data: trajectorybody
+      });
+    } else {
+      const response = await requester.antigravity_fetch(config.api.recordTrajectory, buildRequesterConfig(headers, trajectorybody));
+      if (response.status !== 200) {
+        const errorBody = await response.text();
+        throw new Error(`轨迹分析请求失败 (${response.status}): ${errorBody}`);
+      }
+    }
+  } catch (error) {
+    throw error;
+  }
+}
+export async function sendLog(token, num, trajectoryId) {
+  const Logbody = createTelemetryBatch(num, trajectoryId);
+  const serializeData = serializeTelemetryBatch(Logbody);
+  const serializeLogBody = serializeData.data;
+  const headers = buildHeaders(token);
+  headers["Host"] = "play.googleapis.com";
+  headers["User-Agent"] = "Go-http-client/1.1";
+  headers["Content-Type"] = "application/octet-stream";
+  headers["Accept-Encoding"] = "gzip";
+  try {
+    if (useAxios) {
+      await httpRequest({
+        method: 'POST',
+        url: "https://play.googleapis.com/log",
+        headers,
+        data: serializeLogBody
+      });
+    } else {
+      const response = await requester.antigravity_fetch("https://play.googleapis.com/log", buildRequesterConfig(headers, serializeLogBody));
+      if (response.status !== 200) {
+        const errorBody = await response.text();
+        throw new Error(`log请求失败 (${response.status}): ${errorBody}`);
+      }
+    }
+  } catch (error) {
+    throw error;
+  }
+}
+
+export async function sendRecordCodeAssistMetrics(token, trajectoryId) {
+  const requestBody = buildRecordCodeAssistMetricsBody(token, trajectoryId);
+  const headers = buildHeaders(token);
+  try {
+    if (useAxios) {
+      await httpRequest({
+        method: 'POST',
+        url: "https://daily-cloudcode-pa.googleapis.com/v1internal:recordCodeAssistMetrics",
+        headers,
+        data: requestBody
+      });
+    } else {
+      const response = await requester.antigravity_fetch("https://daily-cloudcode-pa.googleapis.com/v1internal:recordCodeAssistMetrics", buildRequesterConfig(headers, requestBody));
+      if (response.status !== 200) {
+        const errorBody = await response.text();
+        throw new Error(`RecordCodeAssistMetrics请求失败 (${response.status}): ${errorBody}`);
+      }
+    }
+  } catch (error) {
+    throw error;
+  }
+}
+
+export async function sendClientRegister(token) {
+  const requestBody = buildClientRegister(token);
+  const headers = buildClientRegisterHeaders(token);
+  try {
+    if (useAxios) {
+      await httpRequest({
+        method: 'POST',
+        url: "https://antigravity-unleash.goog/api/client/register",
+        headers,
+        data: requestBody
+      });
+    } else {
+      const response = await requester.antigravity_fetch("https://antigravity-unleash.goog/api/client/register", buildRequesterConfig(headers, requestBody));
+      if (response.status !== 200 && response.status !== 202) {
+        const errorBody = await response.text();
+        throw new Error(`ClientRegister请求失败 (${response.status}): ${errorBody}`);
+      }
+    }
+  } catch (error) {
+    throw error;
+  }
+}
+
+export async function sendClientFeature(token) {
+  const headers = buildClientFeatrueHeaders(token);
+  //console.log(headers);
+  try {
+    if (useAxios) {
+      await httpRequest({
+        method: 'GET',
+        url: "https://antigravity-unleash.goog/api/client/features",
+        headers
+      });
+    } else {
+      const response = await requester.antigravity_fetch("https://antigravity-unleash.goog/api/client/features", buildRequesterConfig(headers, null, "GET"));
+      if (response.status !== 200 && response.status !== 202) {
+        const errorBody = await response.text();
+        throw new Error(`ClientFeature请求失败 (${response.status}): ${errorBody}`);
+      }
+    }
+  } catch (error) {
+    throw error;
+  }
+}
+
+export async function sendFrontEnd(token) {
+  const requestBody = buildFrontEnd(token);
+  const headers = buildFrontEndHeaders(token);
+  try {
+    if (useAxios) {
+      await httpRequest({
+        method: 'POST',
+        url: "https://antigravity-unleash.goog/api/frontend",
+        headers,
+        data: requestBody
+      });
+    } else {
+      const response = await requester.antigravity_fetch("https://antigravity-unleash.goog/api/frontend", buildRequesterConfig(headers, requestBody));
+      if (response.status !== 200 && response.status !== 202) {
+        const errorBody = await response.text();
+        throw new Error(`FrontEnd请求失败 (${response.status}): ${errorBody}`);
+      }
+    }
+  } catch (error) {
+    throw error;
+  }
 }
 
 export function closeRequester() {
